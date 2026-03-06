@@ -52,14 +52,14 @@ async function getUnreconciledStatementLines(
   // Try the Finance API first (requires finance.bankstatementsplus.read scope)
   try {
     const financeResponse = await axios.get(
-      "https://api.xero.com/finance.xro/1.0/BankStatements/Accounting",
+      "https://api.xero.com/finance.xro/1.0/BankStatementsPlus/statements",
       {
         headers,
         params: {
-          bankAccountID: bankAccountId,
-          fromDate,
-          toDate,
-          summaryOnly: false,
+          BankAccountID: bankAccountId,
+          FromDate: fromDate,
+          ToDate: toDate,
+          SummaryOnly: false,
         },
       },
     );
