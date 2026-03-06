@@ -1,178 +1,63 @@
-import axios from "axios";
 import { xeroClient } from "../clients/xero-client.js";
+import { BankTransaction } from "xero-node";
+import { getClientHeaders } from "../helpers/get-client-headers.js";
 import { XeroClientResponse } from "../types/tool-response.js";
 import { formatError } from "../helpers/format-error.js";
 
-interface StatementLine {
-  statementLineId: string;
-  postedDate: string;
-  payee: string;
-  reference: string;
-  notes: string;
-  amount: number;
-  transactionDate: string;
-  type: string;
-  isReconciled: boolean;
-}
-
-interface UnreconciledResult {
-  bankAccountId: string;
-  bankAccountName: string;
-  currencyCode: string;
-  unreconciledLines: StatementLine[];
-  totalUnreconciled: number;
-}
-
 /**
- * Fetch unreconciled bank statement lines via the Xero Finance API.
- * Uses GET /finance.xro/1.0/BankStatements/Accounting
- * which returns actual bank feed statement lines (the reconciliation queue).
- *
- * Falls back to direct HTTP since the Finance API scope
- * (finance.bankstatementsplus.read) may not be available on Custom Connections.
- * In that case, tries the Accounting API Reports/BankStatement endpoint.
+ * Internal function to fetch unreconciled bank transactions from Xero.
+ * Uses the where clause to filter for IsReconciled==false and Status!="DELETED".
  */
-async function getUnreconciledStatementLines(
-  bankAccountId: string,
-  fromDate: string,
-  toDate: string,
-): Promise<UnreconciledResult> {
+async function getUnreconciledBankTransactions(
+  page: number,
+  bankAccountId?: string,
+): Promise<BankTransaction[]> {
   await xeroClient.authenticate();
 
-  const tokenSet = xeroClient.readTokenSet();
-  const accessToken = tokenSet.access_token;
-  const tenantId = xeroClient.tenantId;
-
-  const headers = {
-    Authorization: `Bearer ${accessToken}`,
-    "xero-tenant-id": tenantId,
-    Accept: "application/json",
-  };
-
-  // Try the Finance API first (requires finance.bankstatementsplus.read scope)
-  try {
-    const financeResponse = await axios.get(
-      "https://api.xero.com/finance.xro/1.0/BankStatementsPlus/statements",
-      {
-        headers,
-        params: {
-          BankAccountID: bankAccountId,
-          FromDate: fromDate,
-          ToDate: toDate,
-          SummaryOnly: false,
-        },
-      },
-    );
-
-    const data = financeResponse.data;
-    const allLines =
-      data.statements?.flatMap(
-        (stmt: { statementLines?: StatementLine[] }) =>
-          stmt.statementLines ?? [],
-      ) ?? [];
-
-    const unreconciledLines = allLines.filter(
-      (line: StatementLine) =>
-        line.isReconciled === false,
-    );
-
-    return {
-      bankAccountId: data.bankAccountId ?? bankAccountId,
-      bankAccountName: data.bankAccountName ?? "",
-      currencyCode: data.bankAccountCurrencyCode ?? "",
-      unreconciledLines,
-      totalUnreconciled: unreconciledLines.length,
-    };
-  } catch (financeError) {
-    // Finance API not available — try Accounting Reports/BankStatement
-    try {
-      const reportResponse = await axios.get(
-        "https://api.xero.com/api.xro/2.0/Reports/BankStatement",
-        {
-          headers,
-          params: {
-            bankAccountID: bankAccountId,
-            fromDate,
-            toDate,
-          },
-        },
-      );
-
-      const report = reportResponse.data?.Reports?.[0];
-      if (!report) {
-        throw new Error("No bank statement report returned");
-      }
-
-      // Parse the report rows into statement lines
-      const lines: StatementLine[] = [];
-      const rows = report.Rows ?? [];
-      for (const section of rows) {
-        if (section.RowType === "Section" && section.Rows) {
-          for (const row of section.Rows) {
-            if (row.RowType === "Row" && row.Cells) {
-              const cells = row.Cells;
-              lines.push({
-                statementLineId: "",
-                postedDate: cells[0]?.Value ?? "",
-                payee: cells[1]?.Value ?? "",
-                reference: cells[2]?.Value ?? "",
-                notes: "",
-                amount: parseFloat(cells[3]?.Value ?? "0") || 0,
-                transactionDate: cells[0]?.Value ?? "",
-                type: "",
-                isReconciled: false,
-              });
-            }
-          }
-        }
-      }
-
-      return {
-        bankAccountId,
-        bankAccountName: report.ReportName ?? "",
-        currencyCode: "",
-        unreconciledLines: lines,
-        totalUnreconciled: lines.length,
-      };
-    } catch (reportError) {
-      // Both approaches failed — throw a descriptive error
-      const financeMsg =
-        financeError instanceof Error ? financeError.message : String(financeError);
-      const reportMsg =
-        reportError instanceof Error ? reportError.message : String(reportError);
-      throw new Error(
-        `Unable to retrieve bank statement lines. ` +
-          `Finance API error: ${financeMsg}. ` +
-          `Reports API error: ${reportMsg}. ` +
-          `The Finance API requires the 'finance.bankstatementsplus.read' scope ` +
-          `which may not be available on Custom Connection apps.`,
-      );
-    }
+  // Build the where clause: always filter for unreconciled, non-deleted
+  let where = 'IsReconciled==false&&Status!="DELETED"';
+  if (bankAccountId) {
+    where += `&&BankAccount.AccountID=guid("${bankAccountId}")`;
   }
+
+  const response = await xeroClient.accountingApi.getBankTransactions(
+    xeroClient.tenantId,
+    undefined, // ifModifiedSince
+    where,
+    "Date DESC", // order
+    page,
+    undefined, // unitdp
+    100, // pageSize — use max for reconciliation workflows
+    getClientHeaders(),
+  );
+
+  return response.body.bankTransactions ?? [];
 }
 
 /**
- * List unreconciled bank statement lines from Xero.
- * Tries the Finance API first, then falls back to the Reports API.
- * These are the items shown on Xero's reconciliation screen.
- * @param bankAccountId Bank account ID (required)
- * @param fromDate Start date in YYYY-MM-DD format
- * @param toDate End date in YYYY-MM-DD format
+ * List unreconciled coded bank transactions from Xero.
+ * Filters for transactions where IsReconciled==false and Status!="DELETED".
+ *
+ * NOTE: This returns coded transactions that haven't been matched to a bank
+ * feed statement line. It does NOT return pending bank feed lines shown on
+ * Xero's reconciliation screen (those require the partner-only Finance API).
+ * Useful for finding stale unreconciled transfers on accounts without bank feeds.
+ *
+ * @param page Page number for pagination (default 1)
+ * @param bankAccountId Optional bank account ID to filter by
  */
 export async function listXeroUnreconciledBankTransactions(
-  bankAccountId: string,
-  fromDate: string,
-  toDate: string,
-): Promise<XeroClientResponse<UnreconciledResult>> {
+  page: number = 1,
+  bankAccountId?: string,
+): Promise<XeroClientResponse<BankTransaction[]>> {
   try {
-    const result = await getUnreconciledStatementLines(
+    const bankTransactions = await getUnreconciledBankTransactions(
+      page,
       bankAccountId,
-      fromDate,
-      toDate,
     );
 
     return {
-      result,
+      result: bankTransactions,
       isError: false,
       error: null,
     };
