@@ -50,7 +50,7 @@ const ListUnreconciledBankTransactionsTool = CreateXeroTool(
         },
         {
           type: "text" as const,
-          text: `Currency: ${result?.bankAccountCurrencyCode}`,
+          text: `Currency: ${result?.currencyCode}`,
         },
         {
           type: "text" as const,
